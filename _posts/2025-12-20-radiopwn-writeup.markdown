@@ -673,4 +673,3 @@ Stage 2 expanded this into code execution. Two issues made this possible:
 - Predictable heap allocation (tcache), allowing precise placement of attacker-controlled payloads after the algorithm table.
 
 By shaping the heap, embedding a `system()` pointer, and supplying a command string that redirected output to our socket, we achieved RCE and read the flag file.
-In short: weak crypto framing, unchecked lengths, and unsafe function-pointer indexing combined into a clean and stable attack chain, from key leakage to full remote command execution.

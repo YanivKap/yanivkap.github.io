@@ -4,10 +4,12 @@ title:  "RadioPWN Writeup"
 date:   2025-12-20 18:55:15 +0200
 categories: writeups
 ---
+This article presents a technical analysis of selected challenges from Ctrl+Space CTF 2025, a space-themed capture-the-flag competition focused on low-level systems, reversing, and exploitation. The primary focus is a high-difficulty PWN / reversing task involving a custom space communication protocol implemented on top of GNU Radio (SDR), for which I provided remote assistance to the eventual winning team during the competition. In addition, the article includes a second challenge that I analyzed and solved independently after the event concluded.
+
 # Part 1 — Introduction and Challenge Setup
 
 ## Introduction
-The challenge begins with a ZIP archive containing a small server implementation and its supporting artifacts. Although the folder structure appears simple at first glance, a closer inspection reveals that the service implements a custom encryption/decryption protocol based on a GNU Radio extension named mhackeroni.crypter. Our goal is to understand how the service processes incoming data and ultimately leverage this behavior to leak the secret flag stored in its key file.
+The challenge begins with a ZIP archive containing a small server implementation and its supporting artifacts. Although the folder structure appears simple at first glance, a closer inspection reveals that the server implements a custom encryption/decryption protocol based on a GNU Radio extension named `mhackeroni.crypter`. Our goal is to understand how the server processes incoming data and ultimately leverage this behavior to leak the secret flags.
 
 ![hierarchy](/assets/image24.png)
 
@@ -18,7 +20,7 @@ The most relevant files for the first stage of the challenge are:
 This Python script implements a small TCP server. For every incoming connection, the server:
 - Receives arbitrary bytes.
 - Passes them to `mhackeroni.crypter`, initialized with a path to `/tmp/keys`.
-- Sends the “encrypted” (or decrypted, depending on flow direction) output back to the client.
+- Sends the encrypted output back to the client.
 
 In other words, the server itself performs no validation or logic, it simply acts as a pass-through wrapper around the crypter library.
 
@@ -44,7 +46,7 @@ GNU Radio is an open-source toolkit widely used in software-defined radio (SDR) 
 * A message-passing architecture (PMTs, PDUs, blocks)
 * Support for building custom DSP blocks in C++ or Python
 
-In real-world SDR systems, GNU Radio components are chained together to process radio packets, demodulate signals, or implement custom protocols. Developers can extend GNU Radio by creating their own shared libraries, which expose new “blocks” that can be called from Python or integrated into flowgraphs.
+In real-world SDR systems, GNU Radio components are chained together to process radio packets, demodulate signals, or implement custom protocols. Developers can extend GNU Radio by creating their own shared libraries, which expose new "blocks" that can be called from Python or integrated into flowgraphs.
 
 ### Why Does This Challenge Include libgnuradio-mhackeroni.so?
 
@@ -64,7 +66,7 @@ The crypter block processes the payload, decrypts/encrypts it using per-key algo
 ## Interacting with the server 
 Connecting to the server manually (e.g., `nc 127.0.0.1 5000`) and sending arbitrary bytes immediately reveals interesting behavior:
 - The crypter library logs that it loaded the keys file.
-- The server returns transformed data.
+- The server returns untransformed data, which means we need to craft special data for the crypter to modify it.
 
 ![server prints](/assets/image3.png)
 
@@ -79,9 +81,9 @@ At this point, we already understand:
 This strongly suggests that our path to the flag must involve tricking the crypter into leaking key material.
 
 ## Reversing the Crypter
-The logical next step is to reverse the GNU Radio extension. Opening `libgnuradio-mhackeroni.so.1.0.0.0` in IDA and searching for relevant strings, such as “pdu received”
+The logical next step is to reverse the GNU Radio extension. Opening `libgnuradio-mhackeroni.so.1.0.0.0` in IDA and searching for relevant strings, such as "pdu received"
 ![pdu received](/assets/image15.png)
-quickly leads to the main function that processes incoming PDUs. This is the core of the challenge and will later become the foundation for both Stage 1 (key leakage) and Stage 2 (RCE).
+quickly leads to the main function `handle_pdu` that processes incoming PDUs. This is the core of the challenge and will later become the foundation for both Stage 1 (key leakage) and Stage 2 (RCE).
 
 ![handle_pdu](/assets/image8.png)
 
@@ -121,30 +123,19 @@ The function:
 7. Re-emits the processed buffer as a new PDU.
 
 ### Frame Structure
-Encrypted segments follow a strict wire format:
+Encrypted segments follow a strict format:
+
 `0x17, key_id (1B), len_lo (1B), len_hi (1B), algo_id (1B), payload[len]`
 
 Where:
-`key_id` index selects which key to use from the keys table
-`len_lo`,`len_hi` define the payload length
-`algo_id` selects the encryption algorithm
-`payload[]` is the encrypted block processed in-place
+- `key_id` index selects which key to use from the keys table
+- `len_lo`,`len_hi` define the payload length
+- `algo_id` selects the encryption algorithm
+- `payload[]` is the encrypted block processed in-place
 
 If the prefix is `0x17 0x17`, it is treated as an escaped literal byte rather than the start of a frame.
 
-### Step 1: check message shape and print metadata
-- `if (pmt::is_pair(pair))` → OK; otherwise: `"crypter: received non-PDU message"` to `std::cerr`.  
-- Extract` meta = car(pair)` and `data = cdr(pair)`.  
-- Print `"=== PDU Received ==="` and `"Metadata: <meta>"`.  
-- Check that `data` is `u8vector`. If not, it just republishes the original `(meta,data)` as a PDU on the pdus port and returns.
-
-### Step 2: get a raw pointer/length to the u8vector
-- `pmt::u8vector_elements(&data, &len)` → returns `const uint8_t* buf` and fills `len`.  
-- Print `"Data length: <len> bytes"`.  
-
-I’ll call this array `in` and its size `in_len`.
-
-### Step 3: main scan loop over the bytes
+### Main scan loop over the bytes
 The loop walks the input and handles escaping and encrypted blocks. There are two pointers/indexes visible in the decompiled code:
 - `i` (named `v63`) – input index (how far we’ve consumed the original buffer).  
 - `out` (named `v64`) – where to write the resulting bytes (de-escaping can shrink). In practice the code writes back into the same array (in-place) and advances `out` as it produces output.  
@@ -185,7 +176,7 @@ It picks the algorithm from the table by algo_id:
 algo = algos[algo_id];  // e.g., none_algo or xor_algo
 ```
 
-It looks up (or creates & caches) an “encrypter” context for this key_id.
+It looks up (or creates & caches) an "encrypter" context for this key_id.
 
 Decrypt in place: finally it calls the selected algorithm function pointer like:
 
@@ -207,26 +198,6 @@ i += 1 /*0x17*/ + 1 /*key*/ + 2 /*len*/ + 1 /*algo*/ + payloadLen;
 ```
 
 When `i` reaches `in_len`, the loop ends.
-
-### Step 4: package and publish the result
-
-- It prints a newline or two (those ctype::widen + ostream::put calls).
-- It builds a new PMT u8vector from the (now modified) byte array (in place).
-It pairs the original meta with the modified data:
-
-```c
-out_pair = cons(meta, new_u8vector)
-```
-
-It resolves the symbol "pdus" (one-time creation of a PMT symbol) and calls:
-
-```c
-gr::basic_block::message_port_pub(this, "pdus", out_pair);
-```
-
-It does the expected PMT refcount cleanups and returns.
-
-On the error path (not a pair / not a u8vector), it re-publishes the original pair or logs to std::cerr.
 
 ### pseudo-code
 
@@ -272,19 +243,6 @@ on handle_pdu(pair):
 
 That’s the core logic: detect framed blocks, decrypt those blocks in place using a per-key algorithm, de-escape 0x17 0x17, and re-emit the processed PDU.
 
-## Key Insight: Controlled Decryption + Zero Payload = Full Key Leak
-
-From reversing the logic, we learn:
-If we send a valid frame with:
-- A chosen `key_id`
-- `algo_id = XOR`
-- `payload = bytes([0x00] * N)`
-
-Then the decryption output becomes exactly:
-`key repeated until N bytes are filled`
-And because the server returns the processed buffer back to us, this becomes a pure oracle for leaking key material.
-This insight enables Stage 1 of the exploit: retrieving all keys, including the one containing the flag.
-
 # Part 3 — Leveraging the Parsing Logic: Building the Key-Leak Exploit (Stage 1)
 
 ## Understanding the Leak Primitive
@@ -324,10 +282,9 @@ def leak_keys(): # leak key
         send_bytes(frame)
 ```
 
-When sent to the service, every response contains the decrypted key, repeating until the declared payload length is exhausted.
+When sent to the server, every response contains the decrypted key, repeating until the declared payload length is exhausted.
 
-You can clearly see that key 0x0C contains the placeholder flag:
-`space{FAKE_FLAG}`
+You can clearly see that key 0x0C contains the placeholder flag: `space{FAKE_FLAG}`
 
 Stage 1 complete — the entire key table (and the flag) has been leaked successfully:
 ```sh 
@@ -363,10 +320,10 @@ sending b'\x17\x0e@\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
 recv: b'\x17\x0e@\x00\x01hTSrY8C7v31MfTbahTSrY8C7v31MfTbahTSrY8C7v31MfTbahTSrY8C7v31MfTba\x00'
 ```
 
-You can see one of the received flags in the `space{FAKE_FLAG}`
 Now with the real server:
 `space{1m_1n_j4p4n_c4n_y0u_g3t_rc3_f0r_m3?_7yk90lah543}`
-Win!
+
+Victory!
 
 ![discord](/assets/image13.png)
 
@@ -378,7 +335,7 @@ Therefore, leaking keys is no longer useful, we now need code execution.
 
 ## What Changes in Radiopwn2?
 
-In the second challenge, the flag is located in a file called flag (with the contents space{FAKE_FLAG_2}). This file is:
+In the second challenge, the flag is located in a file called flag (with the contents `space{FAKE_FLAG_2}` locally). This file is:
 - Copied into the container via `Dockerfile`
 ![copy flag file](/assets/image9.png)
 - Owned by the same user that runs the service
@@ -395,8 +352,8 @@ From reversing Stage 1 and exploring the crypter behavior deeper, two powerful p
 ### 1. Buffer Over-Read Primitive
 
 If we send a frame where the declared payload length (`len_lo | len_hi << 8`) is greater than the actual number of payload bytes we provide, the crypter will:
-Decrypt in place up to the declared length
 
+- Decrypt in place up to the declared length
 - Read past the end of our buffer
 - Echo back whatever memory lies beyond
 - This gives us memory disclosure, especially useful for examining heap layouts.
@@ -494,8 +451,9 @@ This setup was crucial for identifying the correct offsets, validating that the 
 
 ## Prerequisite: Understanding system()’s Argument
 
-To extract the flag, we need a working shell command whose output returns over our open network socket.
+To extract the flag, we need a working shell command whose output returns over our open socket.
 Examining the file descriptors inside the container:
+
 Before communication:
 ![fd before](/assets/image18.png) 
 After communication:
@@ -528,9 +486,9 @@ To achieve this, we need to:
 1. Shape the heap so that our frame buffer sits immediately after the algorithm table allocation.
 2. Place the `system()` address at a predictable offset relative to the start of that allocation.
 3. Use an out-of-bounds `algo_id` so that `algos[algo_id]` points into our controlled data, where the fake function pointer (`system`) lives.
-4. Make sure the “argument” passed to that function is a pointer to our command string (`"cat flag 1>&7"`).
+4. Make sure the "argument" passed to that function is a pointer to our command string (`"cat flag 1>&7"`).
 
-## Heap Internals: Why tcache Matters
+## Heap Internals: tcache
 
 The algorithm table is allocated with size `0x18` bytes (3 entries × 8-byte function pointers). On glibc, this goes into the tcache bin for size 0x20.
 We can also influence other allocations of similar sizes by sending frames and causing the crypter to allocate and free temporary structures. By carefully choosing:
@@ -545,6 +503,9 @@ we can influence which freed chunks are reused for:
 The end goal is to obtain a heap layout like:
 `[ 0x18-byte chunk: algos table ]
 [ 0x... byte chunk: our frame buffer (controlled) ]`
+
+I found a combination of frames send that results this layout, which is **sending 2 frames size 0x18 and then an exploit frame size 0x28**.
+I achieved this by debugging, examining the tcache bins and the memory layout.
 
 Once this happens, any out-of-bounds index into `algos[]` will read into our frame buffer and interpret it as an array of function pointers.
 
@@ -570,9 +531,9 @@ In the exploit, the final payload looks like:
 
 ```python
 payload = (
-    b'cat  flag 1>&7    '     # command string + spaces for alignment
-    b'\x00'                   # null terminator
-    b'\xc0\x06\x42\x00\x00\x00\x00\x00'
+    b'cat  flag 1>&7    '               # command string + spaces for alignment
+    b'\x00'                             # null terminator
+    b'\xc0\x06\x42\x00\x00\x00\x00\x00' # system address
     b'\x00\x00\x00\x00\x00\x00\x00\x00'
 )
 ```
@@ -584,7 +545,7 @@ Here:
 
 You also choose the frame length so that:
 5 bytes (frame header) + command + `\0` + system address
-neatly fill a 0x18-sized region when combined.
+neatly fill a 0x28-sized region when combined.
 
 ## Finding the Right algo_id Offset
 
@@ -629,26 +590,7 @@ By combining:
 - A stable restart mechanism
 - Controlled allocations via frames
 
-we get a deterministic heap layout, which means the offset (`algo_id = 0x11`) and the position of our crafted chunk stay reliable.
-
-## Debugging: Verifying Layout with GDB
-
-To confirm everything:
-1. Attach `gdb` to the Python process inside the container.
-2. Set a breakpoint in hand`le_pdu near the allocation of the algorithm table.
-3. Send the final malicious frame.
-4. When the breakpoint hits, print memory starting from the algo table address.
-
-The memory dump shows:
-- The `algos` table at the start of the allocation.
-- Immediately following it, our crafted frame data.
-- Inside that frame, the command string and the `system()` pointer.
-
-Once this is verified, we know that:
-- Using `algo_id = 0x11` will indeed index into our fake `system()` pointer.
-- The `payload` argument points to the command string (`"cat flag 1>&7"`).
-
-At that point, letting execution continue triggers the exploit.
+we get a deterministic heap layout, which means the offset (`algo_id = 0x11`) and the position of our crafted chunk stay reliable.  
 
 ## Triggering the Exploit and Getting the Flag
 
@@ -661,18 +603,15 @@ With everything aligned:
 3. The crypter interprets `algos[0x11]` as our fake function pointer.
 4. It calls `system("cat flag 1>&7")`.
 
-Because FD 7 is the socket connecting us to the service, the command:
-`cat flag 1>&7`
+![output flag2](/assets/image11.png)
 
-reads the `flag` file and writes the output directly to our connection.
 Result: the second flag is printed back over the socket.
 
-Win!
+Victory!
 
 We’ve escalated from a controlled key-decryption primitive in Stage 1
 to full code execution with `system()` in Stage 2 and successfully exfiltrated `space{FAKE_FLAG_2}`.
 
-![output flag2](/assets/image11.png)
 
 Here is the working exploit:
 ```python
@@ -728,7 +667,7 @@ def full_exploit():
 # Part 6 — Conclusion
 
 The Radiopwn challenges demonstrate how small design flaws compound into powerful exploitation paths.
-In Stage 1, a weak framing format and unauthenticated XOR “encryption” turned the crypter into a key oracle. Because decryption occurred in place and the output was returned to the client, sending zero-filled payloads directly exposed the keys, including the flag.
+In Stage 1, a weak framing format and unauthenticated XOR "encryption" turned the crypter into a key oracle. Because decryption occurred in place and the output was returned to the client, sending zero-filled payloads directly exposed the keys, including the flag.
 Stage 2 expanded this into code execution. Two issues made this possible:
 - Out-of-bounds algorithm indexing, letting the attacker treat heap data as function pointers.
 - Predictable heap allocation (tcache), allowing precise placement of attacker-controlled payloads after the algorithm table.
